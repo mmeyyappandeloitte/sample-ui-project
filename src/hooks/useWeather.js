@@ -37,59 +37,108 @@ function windDir(deg) {
   return dirs[Math.round(deg / 45) % 8]
 }
 
-// Fallback geocoder: Nominatim (OpenStreetMap) — free, no key, broad global coverage
-async function geocodeWithNominatim(postalCode, countryCode) {
+// ── Geocoding helpers ────────────────────────────────────────────────────────
+
+// Photon (komoot.io) — OpenStreetMap-based, CORS-enabled, free, no API key.
+// Returns lat/lon + best available location name. Used as the universal fallback.
+async function geocodeWithPhoton(postalCode, countryCode) {
   const url =
-    `https://nominatim.openstreetmap.org/search` +
-    `?postalcode=${encodeURIComponent(postalCode)}` +
-    `&country=${countryCode}` +
-    `&format=json&limit=1&addressdetails=1`
+    `https://photon.komoot.io/api/` +
+    `?q=${encodeURIComponent(postalCode)}` +
+    `&countrycode=${countryCode.toLowerCase()}` +
+    `&limit=1`
 
-  const res = await fetch(url, {
-    headers: { 'User-Agent': 'WeatherZip-App/1.0' },
-  })
-
+  const res = await fetch(url)
   if (!res.ok) {
-    throw new Error(`Postal code "${postalCode}" not found. Please check and try again.`)
+    throw new Error(`Postal code "${postalCode}" not found. Please try again.`)
   }
 
   const data = await res.json()
-  if (!data.length) {
+  if (!data.features?.length) {
     throw new Error(
-      `Postal code "${postalCode}" not found in ${countryCode}. ` +
-      `Please check the postal code and try again.`
+      `Postal code "${postalCode}" was not found for ${countryCode}. ` +
+      `Please verify the postal code and try again.`
     )
   }
 
-  const nom  = data[0]
-  const addr = nom.address ?? {}
+  const feat  = data.features[0]
+  const props = feat.properties
+  // GeoJSON coordinates are [longitude, latitude]
+  const lon = feat.geometry.coordinates[0]
+  const lat = feat.geometry.coordinates[1]
 
-  // Best available city name from most-specific to least
   const city =
-    addr.city        ||
-    addr.town        ||
-    addr.village     ||
-    addr.suburb      ||
-    addr.state_district ||
-    addr.county      ||
-    nom.display_name.split(', ')[1] ||
+    props.city     ||
+    props.town     ||
+    props.village  ||
+    props.district ||
+    props.county   ||
     postalCode
 
-  const region    = addr.state ?? ''
-  // ISO3166-2-lvl4 is e.g. "IN-TN" → take the suffix "TN" as the abbreviation
-  const regionAbb = addr['ISO3166-2-lvl4']?.split('-').pop() ?? ''
-  const countryName = addr.country ?? countryCode
-
   return {
-    postalCode: addr.postcode ?? postalCode,
-    lat:        parseFloat(nom.lat),
-    lon:        parseFloat(nom.lon),
+    postalCode,
+    lat,
+    lon,
     city,
-    region,
-    regionAbb,
-    countryName,
+    region:      props.state    ?? '',
+    regionAbb:   '',
+    countryName: props.country  ?? countryCode,
   }
 }
+
+// India-enhanced geocoding: api.postalpincode.in gives the District name (better
+// city name than Photon's county field) + Photon gives lat/lon.
+async function geocodeIndia(postalCode) {
+  // Run both requests in parallel for speed
+  const [indRes, photonRes] = await Promise.all([
+    fetch(`https://api.postalpincode.in/pincode/${postalCode}`),
+    fetch(
+      `https://photon.komoot.io/api/` +
+      `?q=${encodeURIComponent(postalCode)}&countrycode=in&limit=1`
+    ),
+  ])
+
+  // Validate Photon first — we need lat/lon
+  if (!photonRes.ok) {
+    throw new Error(`Postal code "${postalCode}" not found in India. Please verify and try again.`)
+  }
+  const photonData = await photonRes.json()
+  if (!photonData.features?.length) {
+    throw new Error(`Postal code "${postalCode}" not found in India. Please verify and try again.`)
+  }
+  const feat = photonData.features[0]
+  const lon  = feat.geometry.coordinates[0]
+  const lat  = feat.geometry.coordinates[1]
+
+  // Try to enrich city name from India Postal API
+  let city = feat.properties.county || postalCode
+  let region = feat.properties.state || 'India'
+
+  if (indRes.ok) {
+    try {
+      const indData = await indRes.json()
+      if (indData[0]?.Status === 'Success' && indData[0].PostOffice?.length) {
+        const po = indData[0].PostOffice[0]
+        city   = po.District || city    // e.g. "Pudukkottai"
+        region = po.State    || region  // e.g. "Tamil Nadu"
+      }
+    } catch (_) {
+      // India postal API parse failed — fall back to Photon values already set
+    }
+  }
+
+  return {
+    postalCode,
+    lat,
+    lon,
+    city,
+    region,
+    regionAbb:   '',
+    countryName: 'India',
+  }
+}
+
+// ── Main hook ────────────────────────────────────────────────────────────────
 
 export function useWeather() {
   const [state, setState] = useState({ status: 'idle', data: null, error: null })
@@ -101,48 +150,53 @@ export function useWeather() {
     setState({ status: 'loading', data: null, error: null })
 
     try {
-      // ── Step 1: Geocode postal code → lat/lon ──────────────────────────────
-      // Primary: zippopotam.us (fast, structured)
-      // Fallback: Nominatim / OpenStreetMap (broader coverage, e.g. Indian PIN codes)
+      // ── Step 1: Geocode postal code → lat/lon + location info ──────────────
+      //   Primary:   zippopotam.us      (fast, structured, good for most countries)
+      //   India:     postalpincode.in + Photon (best coverage + city names for IN)
+      //   Fallback:  Photon / komoot.io (CORS-enabled, global OSM coverage)
       let geo
 
-      const zipRes = await fetch(
-        `https://api.zippopotam.us/${country.toLowerCase()}/${trimmed}`
-      )
-
-      if (zipRes.ok) {
-        const zipData = await zipRes.json()
-
-        if (zipData.places?.length) {
-          // zippopotam.us has the record
-          const place = zipData.places[0]
-          geo = {
-            postalCode: zipData['post code'],
-            lat:        parseFloat(place.latitude),
-            lon:        parseFloat(place.longitude),
-            city:       place['place name'],
-            region:     place['state'],
-            regionAbb:  place['state abbreviation'],
-            countryName: zipData['country'],
-          }
-        } else {
-          // API returned {} — postal code not in zippopotam.us database; try Nominatim
-          geo = await geocodeWithNominatim(trimmed, country)
-        }
-      } else if (zipRes.status === 404) {
-        // Hard 404 — also try Nominatim before giving up
-        geo = await geocodeWithNominatim(trimmed, country)
+      if (country === 'IN') {
+        // India has very poor zippopotam.us coverage — go straight to the better path
+        geo = await geocodeIndia(trimmed)
       } else {
-        throw new Error(`Geocoding error (${zipRes.status}). Try again.`)
+        const zipRes = await fetch(
+          `https://api.zippopotam.us/${country.toLowerCase()}/${trimmed}`
+        )
+
+        if (zipRes.ok) {
+          const zipData = await zipRes.json()
+          if (zipData.places?.length) {
+            // zippopotam.us has the record
+            const place = zipData.places[0]
+            geo = {
+              postalCode:  zipData['post code'],
+              lat:         parseFloat(place.latitude),
+              lon:         parseFloat(place.longitude),
+              city:        place['place name'],
+              region:      place['state'],
+              regionAbb:   place['state abbreviation'],
+              countryName: zipData['country'],
+            }
+          } else {
+            // Empty {} — postal code not in zippopotam.us database
+            geo = await geocodeWithPhoton(trimmed, country)
+          }
+        } else if (zipRes.status === 404) {
+          // Hard 404 — try Photon before giving up
+          geo = await geocodeWithPhoton(trimmed, country)
+        } else {
+          throw new Error(`Geocoding error (${zipRes.status}). Try again.`)
+        }
       }
 
       const { lat, lon, city, region, regionAbb, countryName } = geo
-      const isUS      = country === 'US'
-      const windUnit  = isUS ? 'mph' : 'kmh'
-      const windLabel = isUS ? 'mph' : 'km/h'
+      const isUS       = country === 'US'
+      const windUnit   = isUS ? 'mph' : 'kmh'
+      const windLabel  = isUS ? 'mph' : 'km/h'
       const tempSymbol = tempUnit === 'fahrenheit' ? '°F' : '°C'
 
-      // ── Step 2: Fetch weather from Open-Meteo (no API key required) ─────────
+      // ── Step 2: Fetch weather from Open-Meteo (free, no API key) ──────────
       const params = new URLSearchParams({
         latitude:  lat,
         longitude: lon,
@@ -174,8 +228,8 @@ export function useWeather() {
 
       const wxRes = await fetch(`https://api.open-meteo.com/v1/forecast?${params}`)
       if (!wxRes.ok) throw new Error(`Weather API error (${wxRes.status}).`)
-      const wx = await wxRes.json()
-      const c  = wx.current
+      const wx    = await wxRes.json()
+      const c     = wx.current
       const cInfo = wmoInfo(c.weather_code)
 
       const forecast = wx.daily.time.map((date, i) => ({
