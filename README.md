@@ -10,7 +10,7 @@ A React weather application that shows real-time weather conditions and a 5-day 
 |---|---|
 | **Local development** | http://localhost:5173 |
 | **Deployed application** | *(add your deployed URL here after deployment)* |
-| **GitHub repository** | *(add your repository URL here)* |
+| **GitHub repository** | https://github.com/mmeyyappandeloitte/sample-ui-project |
 
 ---
 
