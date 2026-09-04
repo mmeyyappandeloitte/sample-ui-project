@@ -26,6 +26,7 @@ const COUNTRIES = [
   { code: 'GB', name: 'United Kingdom' },
   { code: 'HU', name: 'Hungary' },
   { code: 'IS', name: 'Iceland' },
+  { code: 'IN', name: 'India' },
   { code: 'IE', name: 'Ireland' },
   { code: 'IL', name: 'Israel' },
   { code: 'IT', name: 'Italy' },
